@@ -1,35 +1,70 @@
-// server.js
-const WebSocket = require('ws');
+const WebSocket = require("ws");
+const mongoose = require("mongoose");
+require("dotenv").config();
+const Block = require("./models/Block");
 
-require('dotenv').config(); 
 const PORT = process.env.PORT || 3001;
 
 const wss = new WebSocket.Server({ port: PORT });
-console.log("Server Started!");
+console.log("WebSocket server started!");
 
-let blocks = Array(9).fill().map((_, i) => ({ id: i, content: "", lockedBy: null }));
+mongoose.connect(process.env.MONGO_URL)
+  .then(async () => {
+    console.log("MongoDB connected!");
 
-wss.on('connection', (ws) => {
-  ws.send(JSON.stringify({ type: 'init', blocks }));
-  console.log("connected!");
-  
+    // Initialize blocks from DB or insert defaults
+    let blocks = await Block.find();
 
-  ws.on('message', (message) => {
-    const data = JSON.parse(message);
-
-    if (data.type === 'lock') {
-      blocks[data.blockId].lockedBy = data.deviceId || null;
+    if (blocks.length === 0) {
+      blocks = Array(9).fill().map((_, i) => new Block({ id: i, content: "", lockedBy: null }));
+      await Block.insertMany(blocks);
+      blocks = await Block.find(); // re-fetch for consistency
     }
 
-    if (data.type === 'update') {
-      blocks[data.blockId].content = data.content;
-    }
+    wss.on("connection", (ws) => {
+      console.log("Client connected");
 
-    // broadcast to all clients
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify(data));
-      }
+      // Send initial block data
+      ws.send(JSON.stringify({ type: "init", blocks }));
+
+      ws.on("message", async (message) => {
+        const data = JSON.parse(message);
+
+        if (data.type === "lock") {
+          await Block.updateOne({ id: data.blockId }, { lockedBy: data.deviceId || null });
+        }
+
+        if (data.type === "update") {
+          await Block.updateOne({ id: data.blockId }, { content: data.content });
+        }
+
+        if (data.type === "clear") {
+          // Reset all blocks in the DB
+          await Block.updateMany({}, { $set: { content: "", lockedBy: null } });
+
+          // Refresh in-memory state
+          blocks = await Block.find();
+
+          // Broadcast the cleared state to all clients
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ type: "clear" }));
+            }
+          });
+
+          return; // don't rebroadcast original clear message
+        }
+
+        // Broadcast update/lock to all clients
+        if (data.type === "update" || data.type === "lock") {
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify(data));
+            }
+          });
+        }
+      });
     });
-  });
-});
+
+  })
+  .catch((err) => console.error("MongoDB connection error:", err));
